@@ -6,9 +6,11 @@
 #
 # torch is pinned to the CPU build (torch==2.12.1+cpu), which lives on
 # PyTorch's own index rather than PyPI. The --extra-index-url line below makes
-# `pip install -r requirements.txt` resolve it automatically. If the target
-# machine has a GPU and you want CUDA acceleration instead, drop the "+cpu"
-# pin and follow https://pytorch.org/get-started/locally/ for the right build.
+# `pip install -r requirements.txt` resolve it automatically.
+#
+# On a machine with an NVIDIA GPU, install requirements-cuda.txt instead to get
+# a CUDA-enabled torch. benchmark.py auto-detects the GPU at runtime and uses it
+# (falling back to CPU if none is present).
 --extra-index-url https://download.pytorch.org/whl/cpu
 
 annotated-doc==0.0.4
