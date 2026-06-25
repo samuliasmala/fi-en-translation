@@ -15,6 +15,7 @@ Usage:
 """
 
 import argparse
+import platform
 import statistics
 import time
 
@@ -31,9 +32,10 @@ MODELS = [
 WARMUP = 3  # translations excluded from timing stats (model/threadpool warm-up)
 
 
-def load(model_name):
+def load(model_name, device):
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
+    model.to(device)
     model.eval()
     return tokenizer, model
 
@@ -41,7 +43,8 @@ def load(model_name):
 @torch.inference_mode()
 def translate(text, tokenizer, model):
     """Full per-query pipeline: tokenize -> generate -> decode."""
-    batch = tokenizer([text], return_tensors="pt", truncation=True)
+    # Inputs must live on the same device as the model; .to() is a no-op on CPU.
+    batch = tokenizer([text], return_tensors="pt", truncation=True).to(model.device)
     # The model's generation_config already sets max_length=512, which is far
     # longer than any of these queries needs. We rely on it rather than also
     # passing max_new_tokens, which would make transformers warn on every call.
@@ -49,10 +52,10 @@ def translate(text, tokenizer, model):
     return tokenizer.decode(generated[0], skip_special_tokens=True)
 
 
-def benchmark_model(model_name, queries, save_handle=None):
+def benchmark_model(model_name, queries, device, save_handle=None):
     print(f"\nLoading {model_name} ...", flush=True)
     t0 = time.perf_counter()
-    tokenizer, model = load(model_name)
+    tokenizer, model = load(model_name, device)
     load_secs = time.perf_counter() - t0
     print(f"  loaded in {load_secs:.1f}s", flush=True)
 
@@ -99,49 +102,75 @@ def main():
         torch.set_num_threads(args.threads)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print("=" * 70)
+    gpu_note = "GPU present" if device == "cuda" else "no GPU"
     print("Finnish -> English translation benchmark")
-    print(f"  queries     : {len(QUERIES)} (warm-up excluded: {WARMUP})")
-    print(f"  device      : {device}")
-    print(f"  torch threads: {torch.get_num_threads()}")
-    print(f"  torch        : {torch.__version__}")
-    print("=" * 70)
+    print("(run environment & method summary shown with the results below)\n")
 
     save_handle = open(args.save, "w", encoding="utf-8") if args.save else None
     try:
-        results = [benchmark_model(m, QUERIES, save_handle) for m in MODELS]
+        results = [benchmark_model(m, QUERIES, device, save_handle) for m in MODELS]
     finally:
         if save_handle:
             save_handle.close()
 
-    # ---- summary table ----
-    print("\n" + "=" * 70)
-    print("RESULTS — average time per translation (batch size 1, "
-          f"{results[0]['n_timed']} timed queries each)")
-    print("=" * 70)
-    header = f"{'model':40s} {'avg/query':>11s} {'median':>9s} {'min':>8s} {'max':>8s}"
-    print(header)
-    print("-" * len(header))
-    for r in results:
-        print(f"{r['model']:40s} "
-              f"{r['avg'] * 1000:8.1f} ms "
-              f"{r['median'] * 1000:6.1f} ms "
-              f"{r['min'] * 1000:5.0f} ms "
-              f"{r['max'] * 1000:5.0f} ms")
+    print(render_summary(results, device, gpu_note,
+                          save_path=args.save if save_handle else None))
 
-    print("\nHeadline:")
-    for r in results:
-        print(f"  {r['model']:40s}  {r['avg'] * 1000:7.1f} ms/translation "
-              f"(±{r['stdev'] * 1000:.1f} ms)")
 
+def render_summary(results, device, gpu_note, save_path=None):
+    """Build the results + environment/method block.
+
+    Separator lines are sized to the widest content line so they always span
+    the full text. The environment/method info sits beside the results here
+    (rather than at the top of the run) so it reads as a footnote to the numbers.
+    """
+    results_title = ("RESULTS — average time per translation (batch size 1, "
+                     f"{results[0]['n_timed']} timed queries each)")
+    table_header = (f"{'model':40s} {'avg/query':>11s} {'median':>9s} "
+                    f"{'min':>8s} {'max':>8s}")
+    rows = [
+        f"{r['model']:40s} {r['avg'] * 1000:8.1f} ms {r['median'] * 1000:6.1f} ms "
+        f"{r['min'] * 1000:5.0f} ms {r['max'] * 1000:5.0f} ms"
+        for r in results
+    ]
+
+    headline = ["Headline:"] + [
+        f"  {r['model']:40s}  {r['avg'] * 1000:7.1f} ms/translation "
+        f"(±{r['stdev'] * 1000:.1f} ms)"
+        for r in results
+    ]
     if len(results) == 2:
         slower, faster = sorted(results, key=lambda r: r["avg"], reverse=True)
         ratio = slower["avg"] / faster["avg"]
-        print(f"\n  -> {faster['model'].split('/')[-1]} is {ratio:.2f}x faster "
-              f"per translation than {slower['model'].split('/')[-1]}.")
+        headline += ["", f"  -> {faster['model'].split('/')[-1]} is {ratio:.2f}x "
+                         f"faster per translation than {slower['model'].split('/')[-1]}."]
 
-    if save_handle:
-        print(f"\nAll translations written to: {args.save}")
+    env = [
+        "Environment & method",
+        f"  queries      : {len(QUERIES)} (warm-up excluded: {WARMUP})",
+        f"  device       : {device} ({gpu_note})",
+        f"  torch threads: {torch.get_num_threads()}",
+        f"  python       : {platform.python_version()}",
+        f"  torch        : {torch.__version__}",
+        "",
+        (f"  Run environment: Python {platform.python_version()}, torch "
+         f"{torch.__version__} on {device.upper()}, "
+         f"{torch.get_num_threads()} threads, {gpu_note}."),
+        "  Timing covers the full per-query pipeline (tokenize -> beam-search",
+        "  generate -> decode), one query at a time to mirror a doctor typing",
+        f"  one search at a time. First {WARMUP} translations per model excluded "
+        "as warm-up.",
+    ]
+    if save_path:
+        env += ["", f"  All translations written to: {save_path}"]
+
+    width = max(len(line) for line in
+                [results_title, table_header, *rows, *headline, *env])
+    eq, dash = "=" * width, "-" * width
+
+    block = [eq, results_title, eq, table_header, dash, *rows, dash,
+             *headline, dash, *env, eq]
+    return "\n" + "\n".join(block)
 
 
 if __name__ == "__main__":
